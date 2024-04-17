@@ -1,0 +1,160 @@
+name: Deploy
+
+on:
+  push:
+    tags:
+      - "*"
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    timeout-minutes: 45
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-latest
+            image_name: maggie44/ai-voice-assistant
+            docker_file: Dockerfile.ai-assistant
+            platform: linux/arm64
+          - os: ubuntu-latest
+            image_name: maggie44/ai-voice-assistant-interface
+            docker_file: Dockerfile.interface
+            platform: linux/arm64
+
+    runs-on: ${{ matrix.os }}
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Prepare
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Available platforms
+        run: echo ${{ steps.buildx.outputs.platforms }}
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ matrix.image_name }}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./${{ matrix.docker_file }}
+          platforms: ${{ matrix.platform }}
+          tags: ${{ env.REGISTRY }}/${{ matrix.image_name }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Not currently working in self-hosted runners: https://github.com/docker/build-push-action/issues/975
+          # cache-from: type=gha
+          # cache-to: type=gha,mode=max
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ matrix.image_name }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    runs-on: ubuntu-latest
+    needs:
+      - build
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && \
+          sudo apt-get install -y jq
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker Metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ matrix.image_name }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long,prefix=,suffix=
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ matrix.image_name }}@sha256:%s ' *)
+
+  balena-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Decompress images
+        run: |
+          unzip images/rpi4/*
+
+      - name: Load images
+        uses: balena-community/community-cli-action@1.0.0
+        with:
+          balena_token: ${{secrets.BALENA_TOKEN}}
+          balena_cli_commands: >
+            push maggie0002/mlai1;
+            preload images/rpi4/raspberrypi4-64-2.99.27-v14.0.8-dev.img --fleet mlai1 --commit latest;
+            preload images/rpi4/raspberrypi4-64-2.99.27-v14.0.8-prod.img --fleet mlai1 --commit latest;
+          balena_cli_version: 18.1.9
